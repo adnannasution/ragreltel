@@ -3,5 +3,6 @@ langchain
 langchain-openai
 langchain-community
 langchain-experimental
+langchain-core
 psycopg2-binary
 python-dotenv
