@@ -1,8 +1,17 @@
+# Library Utama Telegram & AI
 python-telegram-bot
 langchain
 langchain-openai
 langchain-community
 langchain-experimental
 langchain-core
-psycopg2-binary
 python-dotenv
+
+# Library untuk Versi Database (PostgreSQL)
+psycopg2-binary
+sqlalchemy
+
+# Library untuk Versi Excel & DuckDB
+duckdb
+openpyxl
+pandas
