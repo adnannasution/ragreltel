@@ -15,9 +15,14 @@ from langchain_core.prompts import PromptTemplate
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-# Menggunakan DINOIKI_API_KEY sesuai dengan dashboard Web Bapak
 DINOIKI_API_KEY = os.getenv("DINOIKI_API_KEY")
 
+# Mengambil daftar ID dari Railway Variables (dipisahkan koma)
+# Contoh isi di Railway: 12345678,87654321
+ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
+ALLOWED_USERS = [int(i.strip()) for i in ALLOWED_USERS_RAW.split(",") if i.strip()]
+
+# 2. SETUP AI ENGINE
 TELEGRAM_CUSTOM_PROMPT = """You are a PostgreSQL expert and a helpful AI Assistant for Pak Adnan.
 Given an input question, create a syntactically correct PostgreSQL query to run.
 HANYA BERIKAN QUERY SQL MURNI, TANPA MARKDOWN ATAU BACKTICK.
@@ -39,10 +44,7 @@ ATURAN FORMAT JAWABAN (KHUSUS TELEGRAM):
 Table structure: {table_info}
 Question: {input}"""
 
-# Inisialisasi Database
 db = SQLDatabase.from_uri(DATABASE_URL)
-
-# Inisialisasi LLM via Dinoiki (Disamakan dengan Dashboard Web)
 llm = ChatOpenAI(
     model="gpt-4o",
     openai_api_key=DINOIKI_API_KEY,
@@ -50,64 +52,53 @@ llm = ChatOpenAI(
     temperature=0.7
 )
 
-PROMPT = PromptTemplate(
-    input_variables=["input", "table_info"], 
-    template=TELEGRAM_CUSTOM_PROMPT
-)
+PROMPT = PromptTemplate(input_variables=["input", "table_info"], template=TELEGRAM_CUSTOM_PROMPT)
+db_chain = SQLDatabaseChain.from_llm(llm, db, prompt=PROMPT, verbose=True, return_direct=False)
 
-# Chain utama
-db_chain = SQLDatabaseChain.from_llm(
-    llm, 
-    db, 
-    prompt=PROMPT, 
-    verbose=True,
-    return_direct=False
-)
-
-# 3. FUNGSI MEMBERSIHKAN JAWABAN
 def clean_response(text):
-    """Pembersihan ekstra untuk Telegram"""
-    # Hapus tag HTML sisa jika AI tidak sengaja mengirim tabel/chart
     text = re.sub(r'\[CHART\].*?\[/CHART\]', '', text, flags=re.DOTALL)
     text = re.sub(r'<table.*?>.*?</table>', '', text, flags=re.DOTALL)
-    # Bersihkan sisa-sisa backtick SQL
     text = text.replace("```sql", "").replace("```", "").strip()
     return text
 
-# 4. TELEGRAM BOT HANDLERS
+# 3. TELEGRAM BOT HANDLERS DENGAN WHITELIST
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALLOWED_USERS:
+        print(f"Akses ditolak untuk ID: {user_id}")
+        await update.message.reply_text("⛔ *Akses Ditolak*\nMaaf Pak, Anda tidak diizinkan menggunakan bot ini.")
+        return
+
     await update.message.reply_text(
-        "👋 *Halo Pak Adnan!*\n\nSaya Bot Khusus Telegram untuk monitoring KPI Maintenance.\nSilakan tanya apa saja, saya akan memberikan ringkasan narasinya.",
+        "👋 *Halo Pak Adnan!*\n\nBot sudah aman dan hanya bisa diakses oleh tim terdaftar. Silakan tanya data KPI.",
         parse_mode='Markdown'
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_question = update.message.text
+    user_id = update.effective_user.id
     
-    # Animasi 'typing...'
+    # PROTEKSI: Cek apakah user ada di whitelist
+    if user_id not in ALLOWED_USERS:
+        return # Abaikan jika bukan user terdaftar
+
+    user_question = update.message.text
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
-        # Panggil AI
         response = db_chain.invoke({"query": user_question})
         raw_answer = response.get("result", response)
-        
-        # Bersihkan jawaban agar rapi di HP
         final_answer = clean_response(raw_answer)
-        
         await update.message.reply_text(final_answer, parse_mode='Markdown')
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Maaf Pak, ada kendala teknis: `{str(e)}`", parse_mode='Markdown')
+        await update.message.reply_text(f"⚠️ Kendala teknis: `{str(e)}`", parse_mode='Markdown')
 
-# 5. RUN THE BOT
+# 4. RUN THE BOT
 if __name__ == '__main__':
     if not TOKEN:
-        print("Error: TELEGRAM_BOT_TOKEN belum diset di environment variables!")
+        print("Error: TELEGRAM_BOT_TOKEN belum diset!")
     else:
-        print("🚀 Bot Telegram Khusus KPI sedang berjalan...")
+        print("🚀 Bot Telegram dengan Whitelist sedang berjalan...")
         application = ApplicationBuilder().token(TOKEN).build()
-        
         application.add_handler(CommandHandler('start', start))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-        
         application.run_polling()
