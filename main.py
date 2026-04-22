@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-# LangChain Imports
 from langchain_community.utilities import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
 from langchain_openai import ChatOpenAI
@@ -13,16 +12,24 @@ from langchain_core.prompts import PromptTemplate
 
 # 1. LOAD CONFIGURATION
 load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+TOKEN           = os.getenv("TELEGRAM_BOT_TOKEN")
+DATABASE_URL    = os.getenv("DATABASE_URL")
 DINOIKI_API_KEY = os.getenv("DINOIKI_API_KEY")
 
-# Mengambil daftar ID dari Railway Variables (dipisahkan koma)
-# Contoh isi di Railway: 12345678,87654321
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = [int(i.strip()) for i in ALLOWED_USERS_RAW.split(",") if i.strip()]
 
 # 2. SETUP AI ENGINE
+# sample_rows_in_table_info=0 → table_info hanya skema kolom, tanpa sample data → hemat token
+db = SQLDatabase.from_uri(DATABASE_URL, sample_rows_in_table_info=0)
+
+llm = ChatOpenAI(
+    model="gpt-4o",
+    openai_api_key=DINOIKI_API_KEY,
+    base_url="https://ai.dinoiki.com/v1",
+    temperature=0.7
+)
+
 TELEGRAM_CUSTOM_PROMPT = """You are a PostgreSQL expert and a helpful AI Assistant for a refinery company.
 Given an input question, create a syntactically correct PostgreSQL query to run.
 HANYA BERIKAN QUERY SQL MURNI, TANPA MARKDOWN ATAU BACKTICK.
@@ -40,6 +47,7 @@ ATURAN QUERY SQL:
 - Selalu gunakan NULLIF(kolom_penyebut, 0) untuk menghindari division by zero.
 - Gunakan ROUND(nilai::numeric, 2) untuk pembulatan.
 - Jika pertanyaan melibatkan lebih dari satu tabel, gunakan JOIN yang sesuai.
+- PENTING: Jangan pernah query SELECT * tanpa LIMIT. Selalu gunakan agregasi, filter, atau LIMIT 20.
 - Untuk bad_actor_monitoring: kolom utama adalah ru, tag_number, status, problem, action_plan, progress, target_date.
 - Untuk icu_monitoring: kolom utama adalah ru, icu_status (Medium/High/Critical/Low), tag_no, issue, mitigation, permanent_solution, progress, target_closed, report_date.
 - Untuk program_kerja_atg: kolom utama adalah refinery_unit, type, atg_eksisting, program_2024, prokja (progress), action_plan_category, target, month_update.
@@ -55,22 +63,16 @@ ATURAN QUERY SQL:
 
 ATURAN FORMAT JAWABAN (KHUSUS TELEGRAM — NARASI SAJA):
 1. JAWABAN HARUS FULL NARASI — JANGAN gunakan tabel HTML, JANGAN gunakan format [CHART].
-2. Gunakan poin-poin (•) jika data lebih dari satu agar tetap rapi di layar HP.
-3. Tebalkan poin penting dengan *teks*.
-4. Tambahkan emoticon relevan (🏭, 💰, 📊, ✅, ⚠️, 📈, 📉, 🔧, 🛢️, 🚨, 🔴).
-5. Maksimal 3-4 kalimat per poin agar tidak terlalu panjang di layar HP.
+2. Jika user meminta "tampilkan semua", "list semua", atau data ribuan baris — JANGAN tampilkan semua.
+   Sebagai gantinya: buat RINGKASAN/AGREGASI (jumlah, rata-rata, persentase) lalu sarankan user untuk menyempurnakan pertanyaan ke analisis yang lebih spesifik.
+3. Gunakan poin-poin (•) jika data lebih dari satu agar tetap rapi di layar HP.
+4. Tebalkan poin penting dengan *teks*.
+5. Tambahkan emoticon relevan (🏭, 💰, 📊, ✅, ⚠️, 📈, 📉, 🔧, 🛢️, 🚨, 🔴).
+6. Maksimal 5 poin per jawaban agar tidak terlalu panjang di layar HP.
 
 Question: {input}"""
 
-db = SQLDatabase.from_uri(DATABASE_URL)
-llm = ChatOpenAI(
-    model="gpt-4o",
-    openai_api_key=DINOIKI_API_KEY,
-    base_url="https://ai.dinoiki.com/v1",
-    temperature=0.7
-)
-
-PROMPT = PromptTemplate(input_variables=["input", "table_info"], template=TELEGRAM_CUSTOM_PROMPT)
+PROMPT   = PromptTemplate(input_variables=["input", "table_info"], template=TELEGRAM_CUSTOM_PROMPT)
 db_chain = SQLDatabaseChain.from_llm(llm, db, prompt=PROMPT, verbose=True, return_direct=False)
 
 def clean_response(text):
@@ -79,43 +81,52 @@ def clean_response(text):
     text = text.replace("```sql", "").replace("```", "").strip()
     return text
 
-# 3. TELEGRAM BOT HANDLERS DENGAN WHITELIST
+# 3. TELEGRAM BOT HANDLERS
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS:
         print(f"Akses ditolak untuk ID: {user_id}")
-        await update.message.reply_text("⛔ *Akses Ditolak*\nMaaf Pak, Anda tidak diizinkan menggunakan bot ini.")
+        await update.message.reply_text("⛔ *Akses Ditolak*\nMaaf, Anda tidak diizinkan menggunakan bot ini.", parse_mode='Markdown')
         return
-
     await update.message.reply_text(
-        "👋 *Halo Pak Adnan!*\n\nBot sudah aman dan hanya bisa diakses oleh tim terdaftar. Silakan tanya data KPI.",
+        "👋 *Halo!*\n\nBot siap digunakan. Ajukan pertanyaan analisis data maintenance kilang.\n\n"
+        "💡 *Tips:* Tanyakan ringkasan, perbandingan, atau insight — bukan tampilkan semua data.",
         parse_mode='Markdown'
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # PROTEKSI: Cek apakah user ada di whitelist
     if user_id not in ALLOWED_USERS:
-        return # Abaikan jika bukan user terdaftar
+        return
 
     user_question = update.message.text
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
+
     try:
-        response = db_chain.invoke({"query": user_question})
-        raw_answer = response.get("result", response)
+        response    = db_chain.invoke({"query": user_question})
+        raw_answer  = response.get("result", response)
         final_answer = clean_response(raw_answer)
         await update.message.reply_text(final_answer, parse_mode='Markdown')
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Kendala teknis: `{str(e)}`", parse_mode='Markdown')
+        err = str(e)
+        if "context_length_exceeded" in err:
+            await update.message.reply_text(
+                "⚠️ *Pertanyaan terlalu luas!*\n\n"
+                "Hasil data terlalu besar untuk diproses sekaligus. Coba persempit pertanyaan:\n"
+                "• Sebutkan RU tertentu (misal: *RU II*)\n"
+                "• Minta ringkasan atau jumlah, bukan daftar lengkap\n"
+                "• Tambahkan filter waktu atau status tertentu",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(f"⚠️ Kendala teknis: `{err}`", parse_mode='Markdown')
 
 # 4. RUN THE BOT
 if __name__ == '__main__':
     if not TOKEN:
         print("Error: TELEGRAM_BOT_TOKEN belum diset!")
     else:
-        print("🚀 Bot Telegram dengan Whitelist sedang berjalan...")
+        print("🚀 Bot Telegram sedang berjalan...")
         application = ApplicationBuilder().token(TOKEN).build()
         application.add_handler(CommandHandler('start', start))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
