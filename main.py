@@ -1,22 +1,22 @@
 import os
 import re
+import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
-from langchain_core.runnables import RunnablePassthrough
 
 # 1. LOAD CONFIGURATION
 load_dotenv()
 TOKEN           = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL    = os.getenv("DATABASE_URL")
 DINOIKI_API_KEY = os.getenv("DINOIKI_API_KEY")
+PRISMA_URL      = os.getenv("PRISMA_URL", "")
+CHATBOT_API_KEY = os.getenv("CHATBOT_API_KEY", "")
+PRISMA_HEADERS  = {"x-chatbot-key": CHATBOT_API_KEY}
 
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = [int(i.strip()) for i in ALLOWED_USERS_RAW.split(",") if i.strip()]
@@ -68,6 +68,7 @@ ATURAN QUERY SQL:
 - Selalu gunakan NULLIF(kolom_penyebut, 0) untuk menghindari division by zero.
 - Gunakan ROUND(nilai::numeric, 2) untuk pembulatan.
 - JANGAN query SELECT * tanpa LIMIT. Selalu agregasi, filter, atau LIMIT 20.
+- Untuk anggaran_maintenance: kolom nilai_usd adalah nilai dalam USD. Selalu tampilkan dengan format USD dan pemisah ribuan, contoh: 1,234,567.89 USD.
 - Untuk bad_actor_monitoring: kolom utama adalah ru, tag_number, status, problem, action_plan, progress, target_date.
 - Untuk icu_monitoring: kolom utama adalah ru, icu_status (Medium/High/Critical/Low), tag_no, issue, mitigation, permanent_solution, progress, target_closed, report_date.
 - Untuk program_kerja_atg: kolom utama adalah refinery_unit, type, atg_eksisting, program_2024, prokja, action_plan_category, target, month_update.
@@ -80,7 +81,7 @@ ATURAN QUERY SQL:
 - Untuk critical_eqp_prim_sec: kolom refinery_unit, unit_proses, equipment, highlight_issue, corrective_action, mitigasi_action.
 - Untuk monitoring_operasi: kolom refinery_unit, unit_proses, unit, design, minimal_capacity, plant_readiness, actual, target_sts.
 - Untuk inspection_plan: kolom refinery_unit, area, tag_no_ln, type_equipment, type_inspection, due_date, plan_date, actual_date, result_remaining_life, grand_result.
-- Untuk tkdn: Tingkat Kandungan Dalam Negeri — kolom refinery_unit, bulan, nominal, kdn, persentase, tahun.
+- Untuk tkdn: Tingkat Kandungan Dalam Negeri — kolom refinery_unit, bulan, nominal (IDR), kdn (IDR), persentase (%), tahun. Selalu tampilkan nominal dan kdn dengan format Rp dan pemisah ribuan.
 - Untuk rcps_rekomendasi: rekomendasi dari RCPS — kolom kilang, rcps_no, judul_rcps, rekomendasi, traffic, pic, target, remark.
 - Untuk rcps: daftar RCPS — kolom kilang, traffic, sum_of_progress, disiplin, judul_rcps, rcps_no, criticallity.
 - Untuk boc: Basis of Comparison equipment — kolom ru, area, unit, equipment, status, frequency, running_hours, mttr, mtbf, hasil.
@@ -90,6 +91,10 @@ ATURAN QUERY SQL:
 - Untuk workplan_tank: workplan perbaikan tangki — kolom unit, tag_no, item, remark, rtl_action_plan, target, status_rtl, month_update.
 - Untuk readiness_spm: kesiapan operasional SPM — kolom refinery_unit, tag_no, status_operation, status_laik_operasi, expired_laik_operasi, status_ijin_spl, status_mbc, status_lds, status_mooring_hawser, status_floating_hose, status_cathodic_spl, month_update.
 - Untuk spm_workplan: workplan perbaikan SPM — kolom refinery_unit, tag_no, item, remark, rtl_action_plan, target, status_rtl, month_update.
+
+TABEL PRISMA TA-ex (query via query_prisma, BUKAN DB lokal):
+- taex_reservasi, prisma_reservasi, kumpulan_summary, sap_pr, sap_po, work_order
+- Keyword PRISMA: turnaround, TA, material, reservasi, PR, PO, kertas kerja, work order TA, belum pr, sudah pr, procurement
 
 ATURAN FORMAT JAWABAN (KHUSUS TELEGRAM):
 1. JAWABAN FULL NARASI — JANGAN gunakan tabel HTML, JANGAN format [CHART].
@@ -111,6 +116,27 @@ DUMP_KEYWORDS = [
     "semua issue", "semua mitigasi", "semua prokja",
 ]
 
+PRISMA_KEYWORDS = [
+    "turnaround", "ta-ex", "taex", "reservasi", "material ta",
+    "purchase request", " pr ", "purchase order", " po ",
+    "kertas kerja", "work order ta", "belum pr", "sudah pr",
+    "sap pr", "sap po", "procurement",
+]
+
+def query_prisma(sql: str) -> dict:
+    if not PRISMA_URL:
+        return {"ok": False, "error": "PRISMA_URL belum dikonfigurasi"}
+    try:
+        r = requests.post(
+            f"{PRISMA_URL}/chatbot/query",
+            headers=PRISMA_HEADERS,
+            json={"sql": sql},
+            timeout=30
+        )
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def clean_response(text):
     text = re.sub(r'\[CHART\].*?\[/CHART\]', '', text, flags=re.DOTALL)
     text = re.sub(r'\[DOWNLOAD:\w+\]', '', text)
@@ -122,6 +148,7 @@ async def run_query_with_memory(user_id: int, question: str) -> str:
     """Jalankan query AI dengan konteks history percakapan."""
     history = get_history(user_id)
     table_info = db.get_table_info()
+    q_lower = question.lower()
 
     # Build prompt dengan history
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(table_info=table_info)}]
@@ -132,22 +159,37 @@ async def run_query_with_memory(user_id: int, question: str) -> str:
             messages.append({"role": "assistant", "content": msg.content})
     messages.append({"role": "user", "content": question})
 
-    # Step 1: Generate SQL
-    sql_response = llm.invoke(messages + [
-        {"role": "user", "content": f"Berikan HANYA query SQL PostgreSQL untuk menjawab: {question}. Tanpa penjelasan."}
-    ])
-    sql_query = sql_response.content.replace("```sql", "").replace("```", "").strip()
+    is_prisma = PRISMA_URL and any(kw in q_lower for kw in PRISMA_KEYWORDS)
 
-    # Step 2: Execute SQL
-    try:
-        db_result = db.run(sql_query)
-    except Exception as e:
-        db_result = f"Error query: {str(e)}"
+    if is_prisma:
+        # PRISMA PATH
+        sql_response = llm.invoke(messages + [{"role": "user", "content": (
+            f"Berikan HANYA query SQL PostgreSQL untuk tabel PRISMA TA-ex "
+            f"(taex_reservasi, prisma_reservasi, kumpulan_summary, sap_pr, sap_po, work_order). "
+            f"Kolom 'order' WAJIB pakai tanda kutip ganda. LIMIT 50. SQL murni saja.\n"
+            f"Pertanyaan: {question}"
+        )}])
+        sql_query = sql_response.content.replace("```sql", "").replace("```", "").strip()
+        prisma_result = query_prisma(sql_query)
+        if prisma_result.get("ok"):
+            db_result = f"Hasil PRISMA ({prisma_result.get('rows',0)} baris):\n{prisma_result.get('data',[])}"
+        else:
+            db_result = f"Query PRISMA gagal: {prisma_result.get('error')}"
+    else:
+        # LOCAL DB PATH
+        sql_response = llm.invoke(messages + [
+            {"role": "user", "content": f"Berikan HANYA query SQL PostgreSQL untuk menjawab: {question}. Tanpa penjelasan."}
+        ])
+        sql_query = sql_response.content.replace("```sql", "").replace("```", "").strip()
+        try:
+            db_result = db.run(sql_query)
+        except Exception as e:
+            db_result = f"Error query: {str(e)}"
 
-    # Step 3: Generate answer dengan hasil query + history
+    # Generate jawaban final
     messages.append({
         "role": "user",
-        "content": f"Hasil query SQL:\n{db_result}\n\nBerikan jawaban dalam Bahasa Indonesia sesuai aturan format."
+        "content": f"Hasil query SQL:\n{db_result}\n\nBerikan jawaban dalam Bahasa Indonesia sesuai aturan format Telegram."
     })
     final_response = llm.invoke(messages)
     return final_response.content
@@ -159,13 +201,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ *Akses Ditolak*\nMaaf, Anda tidak diizinkan menggunakan bot ini.", parse_mode='Markdown')
         return
     clear_history(user_id)
-    await update.message.reply_text(
-        "👋 *Halo!*\n\nBot siap digunakan dengan memori percakapan.\n"
-        "Saya akan mengingat konteks pertanyaan sebelumnya dalam sesi ini.\n\n"
-        "💡 *Tips:* Tanyakan analisis, perbandingan, atau insight — bukan tampilkan semua data.\n\n"
-        "Ketik /reset untuk memulai percakapan baru.",
-        parse_mode='Markdown'
-    )
+    is_group = update.message.chat.type in ("group", "supergroup")
+    bot_username = (await context.bot.get_me()).username
+    if is_group:
+        await update.message.reply_text(
+            f"👋 *Halo semua!*\n\n"
+            f"Saya siap membantu analisis data maintenance kilang.\n\n"
+            f"💡 Cara pakai di group — mention saya:\n"
+            f"`@{bot_username} berapa ATG expired di RU II?`\n\n"
+            f"Ketik /reset untuk memulai sesi baru.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "👋 *Halo!*\n\nBot siap digunakan dengan memori percakapan.\n"
+            "Saya akan mengingat konteks pertanyaan sebelumnya dalam sesi ini.\n\n"
+            "💡 *Tips:* Tanyakan analisis, perbandingan, atau insight — bukan tampilkan semua data.\n\n"
+            "Ketik /reset untuk memulai percakapan baru.",
+            parse_mode='Markdown'
+        )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -179,7 +233,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ALLOWED_USERS:
         return
 
-    user_question = update.message.text
+    message = update.message
+    text = message.text or ""
+
+    # ── Deteksi konteks: private chat vs group ──────────────────────────────
+    is_group = message.chat.type in ("group", "supergroup")
+
+    if is_group:
+        bot_username = (await context.bot.get_me()).username
+        # Di group: hanya proses jika di-mention @botname
+        if f"@{bot_username}" not in text:
+            return
+        # Hapus mention dari pertanyaan
+        user_question = text.replace(f"@{bot_username}", "").strip()
+        if not user_question:
+            await message.reply_text(
+                "👋 Halo! Silakan ajukan pertanyaan setelah mention saya.\n"
+                f"Contoh: *@{bot_username} berapa ATG expired di RU II?*",
+                parse_mode='Markdown'
+            )
+            return
+    else:
+        user_question = text
+
     q_lower = user_question.lower()
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
